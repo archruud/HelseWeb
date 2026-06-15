@@ -1,9 +1,51 @@
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { FileText, MessageSquare, Plus, Printer, Download } from 'lucide-react';
 import api from '../api/client';
 import { useAuthStore } from '../stores/authStore';
+
+// PDF viewer that fetches the file with auth token and shows it inline (no new tab)
+function PdfViewer({ documentId, ocrText }: { documentId: string; ocrText?: string }) {
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    let revoked: string | null = null;
+    setError(false);
+    setPdfUrl(null);
+    api
+      .get(`/documents/${documentId}/pdf`, { responseType: 'blob' })
+      .then((res) => {
+        const url = URL.createObjectURL(res.data);
+        revoked = url;
+        setPdfUrl(url);
+      })
+      .catch(() => setError(true));
+    return () => {
+      if (revoked) URL.revokeObjectURL(revoked);
+    };
+  }, [documentId]);
+
+  if (error) {
+    return (
+      <div className="prose max-w-none whitespace-pre-wrap text-sm">
+        <p className="text-amber-600 mb-2">Kunne ikke laste PDF. Viser tekstinnhold:</p>
+        {ocrText || 'Ingen tekstinnhold tilgjengelig.'}
+      </div>
+    );
+  }
+
+  if (!pdfUrl) {
+    return <div className="text-center text-gray-400 py-12">Laster PDF...</div>;
+  }
+
+  return (
+    <object data={pdfUrl} type="application/pdf" className="w-full h-full min-h-[600px] border rounded">
+      <iframe src={pdfUrl} className="w-full h-full min-h-[600px] border rounded" title="PDF Viewer" />
+    </object>
+  );
+}
 
 export default function DocumentView() {
   const { id } = useParams();
@@ -11,7 +53,7 @@ export default function DocumentView() {
   const queryClient = useQueryClient();
   const [newNote, setNewNote] = useState('');
   const [noteType, setNoteType] = useState('note');
-  
+
   const { data: doc, isLoading } = useQuery({
     queryKey: ['document', id],
     queryFn: async () => {
@@ -19,7 +61,7 @@ export default function DocumentView() {
       return res.data;
     },
   });
-  
+
   const { data: annotations } = useQuery({
     queryKey: ['annotations', id],
     queryFn: async () => {
@@ -27,7 +69,7 @@ export default function DocumentView() {
       return res.data;
     },
   });
-  
+
   const addAnnotation = useMutation({
     mutationFn: async () => {
       await api.post('/annotations/', {
@@ -41,10 +83,20 @@ export default function DocumentView() {
       setNewNote('');
     },
   });
-  
+
+  const handleDownload = async () => {
+    const res = await api.get(`/documents/${id}/pdf`, { responseType: 'blob' });
+    const url = URL.createObjectURL(res.data);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${doc?.title || 'dokument'}.pdf`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   if (isLoading) return <div className="text-center py-8">Laster dokument...</div>;
   if (!doc) return <div className="text-center py-8">Dokument ikke funnet</div>;
-  
+
   return (
     <div className="flex gap-6 h-full">
       {/* Document viewer (left side) */}
@@ -57,31 +109,21 @@ export default function DocumentView() {
             </p>
           </div>
           <div className="flex gap-2">
-            <button className="p-2 hover:bg-gray-100 rounded" title="Skriv ut">
+            <button onClick={() => window.print()} className="p-2 hover:bg-gray-100 rounded" title="Skriv ut">
               <Printer size={18} />
             </button>
-            <button className="p-2 hover:bg-gray-100 rounded" title="Last ned">
+            <button onClick={handleDownload} className="p-2 hover:bg-gray-100 rounded" title="Last ned">
               <Download size={18} />
             </button>
           </div>
         </div>
-        
-        {/* PDF embed or text view */}
+
+        {/* PDF view (inline) */}
         <div className="flex-1 overflow-auto p-4">
-          {doc.file_path ? (
-            <iframe
-              src={`/files/${doc.file_path.split('/').pop()}`}
-              className="w-full h-full min-h-[600px] border rounded"
-              title="PDF Viewer"
-            />
-          ) : (
-            <div className="prose max-w-none whitespace-pre-wrap text-sm">
-              {doc.ocr_text || 'Ingen tekstinnhold tilgjengelig.'}
-            </div>
-          )}
+          <PdfViewer documentId={id!} ocrText={doc.ocr_text} />
         </div>
       </div>
-      
+
       {/* Annotations panel (right side) */}
       <div className="w-96 bg-white rounded-lg shadow flex flex-col">
         <div className="p-4 border-b">
@@ -90,7 +132,7 @@ export default function DocumentView() {
             Notater og kommentarer
           </h3>
         </div>
-        
+
         {/* Document metadata */}
         <div className="p-4 border-b bg-gray-50 text-sm space-y-1">
           <p><span className="font-medium">Type:</span> {doc.document_type}</p>
@@ -105,7 +147,7 @@ export default function DocumentView() {
             </div>
           )}
         </div>
-        
+
         {/* Existing annotations */}
         <div className="flex-1 overflow-auto p-4 space-y-3">
           {annotations?.map((ann: any) => (
@@ -127,9 +169,9 @@ export default function DocumentView() {
             </p>
           )}
         </div>
-        
+
         {/* Add annotation form */}
-        {(user?.role === 'admin' || user?.role === 'doctor') && (
+        {(user?.role === 'admin' || user?.role === 'doctor' || user?.role === 'super_editor' || user?.role === 'editor') && (
           <div className="p-4 border-t">
             <select
               value={noteType}

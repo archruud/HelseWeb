@@ -2,6 +2,7 @@
 from datetime import date, datetime
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, extract, and_, or_
 from pydantic import BaseModel
@@ -316,6 +317,21 @@ async def upload_document(
     # TODO: Trigger async OCR and AI processing via Celery
     
     return {"id": str(doc.id), "message": "Dokument lastet opp", "file_path": file_path}
+
+
+@router.get("/{document_id}/pdf")
+async def get_document_pdf(
+    document_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve the PDF file for a document by its ID."""
+    result = await db.execute(select(Document).where(Document.id == uuid.UUID(document_id)))
+    doc = result.scalar_one_or_none()
+    if not doc or not doc.file_path:
+        raise HTTPException(status_code=404, detail="PDF ikke funnet")
+    if not os.path.exists(doc.file_path):
+        raise HTTPException(status_code=404, detail="PDF-fil mangler på disk")
+    return FileResponse(doc.file_path, media_type="application/pdf", filename=os.path.basename(doc.file_path))
 
 
 @router.get("/thread/{thread_id}")
