@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { ChevronRight, ChevronDown, FileText, Calendar, Building2, Search, Brain, Clock, Shield, FolderOpen } from 'lucide-react';
+import { ChevronRight, ChevronDown, FileText, Calendar, Building2, Search, Brain, Clock, Shield, FolderOpen, Users } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import api from '../api/client';
 import { useAuthStore } from '../stores/authStore';
