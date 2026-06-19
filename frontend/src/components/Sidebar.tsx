@@ -84,12 +84,16 @@ export default function Sidebar() {
     { path: '/', label: 'Oversikt', icon: FileText },
     { path: '/search', label: 'Søk', icon: Search },
     { path: '/timeline', label: 'Tidslinje', icon: Clock },
-    { path: '/ai', label: 'AI Assistent', icon: Brain },
-    { path: '/private', label: 'Mine filer', icon: Shield },
   ];
-  
+
+  if (user?.permissions?.includes('ai_query')) {
+    navItems.push({ path: '/ai', label: 'AI Assistent', icon: Brain });
+  }
+  if (user?.permissions?.includes('view_private')) {
+    navItems.push({ path: '/private', label: 'Mine filer', icon: Shield });
+  }
   if (user?.role === 'admin') {
-    navItems.push({ path: '/admin', label: 'Administrasjon', icon: Shield });
+    navItems.push({ path: '/admin', label: 'Administrasjon', icon: Users });
   }
   
   return (

@@ -14,7 +14,7 @@ from app.routers import auth, documents, hospitals, annotations, private_files, 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Startup - create tables if missing
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
@@ -31,7 +31,7 @@ app = FastAPI(
 # CORS - Allow frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:3000", "http://localhost:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,7 +40,6 @@ app.add_middleware(
 # Mount static files (uploaded documents)
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 os.makedirs(settings.PRIVATE_DIR, exist_ok=True)
-app.mount("/files", StaticFiles(directory=settings.UPLOAD_DIR), name="files")
 
 # Include routers
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])

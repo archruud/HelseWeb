@@ -7,6 +7,8 @@ interface User {
   full_name: string;
   role: string;
   email?: string;
+  is_system_admin?: boolean;
+  permissions?: string[];
 }
 
 interface AuthState {

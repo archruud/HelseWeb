@@ -44,7 +44,7 @@ async def get_annotations(document_id: str, db: AsyncSession = Depends(get_db), 
         # Check visibility
         if ann.visibility == "admin_only" and current_user.role != "admin":
             continue
-        if ann.visibility == "doctors_only" and current_user.role not in ("admin", "doctor"):
+        if ann.visibility == "doctors_only" and current_user.role not in ("admin", "super_editor", "editor"):
             continue
         annotations.append(AnnotationResponse(
             id=str(ann.id),
@@ -60,7 +60,7 @@ async def get_annotations(document_id: str, db: AsyncSession = Depends(get_db), 
 
 @router.post("/", response_model=AnnotationResponse)
 async def create_annotation(data: AnnotationCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if current_user.role not in ("admin", "doctor", "psychologist"):
+    if current_user.role not in ("admin", "super_editor", "editor"):
         raise HTTPException(status_code=403, detail="Ikke tilgang til å legge til notater")
     
     ann = Annotation(

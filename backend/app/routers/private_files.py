@@ -9,19 +9,15 @@ import uuid, os, shutil
 from app.config import settings
 from app.database import get_db
 from app.models import PrivateFile, User
-from app.routers.auth import get_current_user, require_role
+from app.routers.auth import get_current_user, require_role, require_permission, user_permissions
 
 router = APIRouter()
 
 @router.get("/")
 async def list_private_files(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if current_user.role not in ("admin",):
-        # Check if user has specific permission
-        result = await db.execute(
-            select(PrivateFile).where(PrivateFile.allowed_roles.contains([current_user.role]))
-        )
-    else:
-        result = await db.execute(select(PrivateFile).order_by(PrivateFile.created_at.desc()))
+    if "view_private" not in user_permissions(current_user.role):
+        raise HTTPException(status_code=403, detail="Din rolle har ikke tilgang til private filer")
+    result = await db.execute(select(PrivateFile).order_by(PrivateFile.created_at.desc()))
     
     files = result.scalars().all()
     return [{
@@ -42,7 +38,7 @@ async def upload_private_file(
     file_type: str = "document",
     description: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_role("admin"))
+    current_user: User = Depends(require_permission("view_private"))
 ):
     file_id = str(uuid.uuid4())
     file_ext = os.path.splitext(file.filename)[1]

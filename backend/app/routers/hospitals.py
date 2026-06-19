@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from app.database import get_db
 from app.models import Hospital, Document, User
-from app.routers.auth import get_current_user
+from app.routers.auth import get_current_user, user_permissions
 
 router = APIRouter()
 

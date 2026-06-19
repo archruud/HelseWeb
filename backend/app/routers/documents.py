@@ -1,10 +1,10 @@
-"""Documents router - CRUD, search, tree view, upload."""
+"""Documents router - CRUD, consistent search, tree view, threads, PDF."""
 from datetime import date, datetime
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, extract, and_, or_
+from sqlalchemy import select, func, and_, or_, text, desc
 from pydantic import BaseModel
 import uuid
 import os
@@ -13,12 +13,15 @@ import shutil
 from app.config import settings
 from app.database import get_db
 from app.models import Document, Hospital, User
-from app.routers.auth import get_current_user
+from app.routers.auth import get_current_user, user_permissions
 
 router = APIRouter()
 
 
-# Pydantic schemas
+def can_see_psychiatric(user: User) -> bool:
+    return "view_psychiatric" in user_permissions(user.role)
+
+
 class DocumentResponse(BaseModel):
     id: str
     document_number: Optional[str]
@@ -32,107 +35,66 @@ class DocumentResponse(BaseModel):
     document_date: Optional[date]
     page_count: Optional[int]
     summary: Optional[str]
-    diagnoses: Optional[List[str]]
-    keywords: Optional[List[str]]
     thread_id: Optional[str]
-    has_annotations: bool = False
-    annotation_count: int = 0
     file_path: str
 
-class TreeNode(BaseModel):
-    id: str
-    label: str
-    type: str  # year, month, hospital, document
-    children: Optional[List["TreeNode"]] = None
-    document_id: Optional[str] = None
-    count: Optional[int] = None
 
 class SearchResult(BaseModel):
     documents: List[DocumentResponse]
     total: int
     page: int
     page_size: int
+    grouped_by_department: dict = {}
 
 
 @router.get("/tree")
-async def get_document_tree(
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Get hierarchical tree: Year -> Month -> Hospital -> Documents."""
-    # Get all documents with hospital info
+async def get_document_tree(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Hierarchical tree: Year -> Month -> Hospital -> Documents."""
     query = select(Document, Hospital.name.label("hospital_name")).outerjoin(
         Hospital, Document.hospital_id == Hospital.id
     ).order_by(Document.document_date.desc())
-    
-    # Filter by role permissions
-    if current_user.role not in ("admin", "doctor"):
+
+    if not can_see_psychiatric(current_user):
         query = query.where(Document.category != "psychiatric")
-    
+
     result = await db.execute(query)
     rows = result.all()
-    
-    # Build tree structure
+
+    month_names = ["Januar", "Februar", "Mars", "April", "Mai", "Juni",
+                   "Juli", "August", "September", "Oktober", "November", "Desember"]
     tree = {}
     for doc, hospital_name in rows:
         if not doc.document_date:
-            year = "Ukjent år"
-            month = "Ukjent"
+            year, month = "Ukjent år", "Ukjent"
         else:
             year = str(doc.document_date.year)
-            month_names = ["Januar", "Februar", "Mars", "April", "Mai", "Juni",
-                          "Juli", "August", "September", "Oktober", "November", "Desember"]
             month = month_names[doc.document_date.month - 1]
-        
         hosp = hospital_name or "Ukjent sykehus"
-        
-        if year not in tree:
-            tree[year] = {}
-        if month not in tree[year]:
-            tree[year][month] = {}
-        if hosp not in tree[year][month]:
-            tree[year][month][hosp] = []
-        
-        tree[year][month][hosp].append({
-            "id": str(doc.id),
-            "title": doc.title,
-            "type": doc.document_type,
-            "date": str(doc.document_date) if doc.document_date else None
+        tree.setdefault(year, {}).setdefault(month, {}).setdefault(hosp, []).append({
+            "id": str(doc.id), "title": doc.title, "date": str(doc.document_date) if doc.document_date else None,
         })
-    
-    # Convert to tree nodes
+
     tree_nodes = []
     for year in sorted(tree.keys(), reverse=True):
         year_children = []
-        for month in tree[year]:
+        # Keep month order chronological within a year
+        for month in sorted(tree[year].keys(), key=lambda m: month_names.index(m) if m in month_names else 99):
             month_children = []
-            for hospital in tree[year][month]:
+            for hospital in sorted(tree[year][month].keys()):
                 docs = tree[year][month][hospital]
                 hospital_children = [
                     {"id": d["id"], "label": f"{d['date']} - {d['title']}", "type": "document", "document_id": d["id"]}
                     for d in docs
                 ]
                 month_children.append({
-                    "id": f"{year}-{month}-{hospital}",
-                    "label": hospital,
-                    "type": "hospital",
-                    "children": hospital_children,
-                    "count": len(hospital_children)
+                    "id": f"{year}-{month}-{hospital}", "label": hospital, "type": "hospital",
+                    "children": hospital_children, "count": len(hospital_children),
                 })
-            year_children.append({
-                "id": f"{year}-{month}",
-                "label": month,
-                "type": "month",
-                "children": month_children
-            })
+            year_children.append({"id": f"{year}-{month}", "label": month, "type": "month", "children": month_children})
         tree_nodes.append({
-            "id": year,
-            "label": year,
-            "type": "year",
-            "children": year_children,
-            "count": sum(len(tree[year][m][h]) for m in tree[year] for h in tree[year][m])
+            "id": year, "label": year, "type": "year", "children": year_children,
+            "count": sum(len(tree[year][m][h]) for m in tree[year] for h in tree[year][m]),
         })
-    
     return tree_nodes
 
 
@@ -142,88 +104,117 @@ async def search_documents(
     hospital_id: Optional[int] = None,
     document_type: Optional[str] = None,
     category: Optional[str] = None,
+    department: Optional[str] = None,
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
+    group_by_department: bool = False,
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    """Full-text search with filters."""
-    query = select(Document, Hospital.name.label("hospital_name")).outerjoin(
-        Hospital, Document.hospital_id == Hospital.id
-    )
-    count_query = select(func.count(Document.id))
-    
-    # Apply filters
+    """Consistent full-text search using PostgreSQL norwegian tsvector.
+    When filtering by hospital, returns ALL matching docs sorted by department + date.
+    """
     filters = []
+
+    # Full-text search via tsvector (consistent, ranked) with ILIKE fallback
+    rank_order = None
     if q:
+        ts_query = func.plainto_tsquery('norwegian', q)
         filters.append(
             or_(
-                Document.ocr_text.ilike(f"%{q}%"),
+                Document.search_vector.op('@@')(ts_query),
                 Document.title.ilike(f"%{q}%"),
-                Document.doctor_name.ilike(f"%{q}%")
+                Document.ocr_text.ilike(f"%{q}%"),
+                Document.department.ilike(f"%{q}%"),
             )
         )
+        rank_order = func.ts_rank(Document.search_vector, ts_query)
+
     if hospital_id:
         filters.append(Document.hospital_id == hospital_id)
     if document_type:
         filters.append(Document.document_type == document_type)
     if category:
         filters.append(Document.category == category)
+    if department:
+        filters.append(Document.department.ilike(f"%{department}%"))
     if date_from:
         filters.append(Document.document_date >= date_from)
     if date_to:
         filters.append(Document.document_date <= date_to)
-    
-    # Role-based filtering
-    if current_user.role not in ("admin", "doctor", "psychologist"):
+
+    if not can_see_psychiatric(current_user):
         filters.append(Document.category != "psychiatric")
-    
+
+    base = select(Document, Hospital.name.label("hospital_name")).outerjoin(
+        Hospital, Document.hospital_id == Hospital.id
+    )
+    count_q = select(func.count(Document.id))
     if filters:
-        query = query.where(and_(*filters))
-        count_query = count_query.where(and_(*filters))
-    
-    # Get total count
-    total_result = await db.execute(count_query)
-    total = total_result.scalar()
-    
-    # Paginate
-    query = query.order_by(Document.document_date.desc()).offset((page - 1) * page_size).limit(page_size)
-    result = await db.execute(query)
-    rows = result.all()
-    
+        base = base.where(and_(*filters))
+        count_q = count_q.where(and_(*filters))
+
+    total = (await db.execute(count_q)).scalar()
+
+    # Sorting: by relevance if text query, else by department then date.
+    # When grouping by department (e.g. all docs from a hospital), sort dept + date.
+    if hospital_id or group_by_department:
+        base = base.order_by(Document.department.asc().nullslast(), Document.document_date.desc())
+    elif rank_order is not None:
+        base = base.order_by(desc(rank_order), Document.document_date.desc())
+    else:
+        base = base.order_by(Document.document_date.desc())
+
+    base = base.offset((page - 1) * page_size).limit(page_size)
+    rows = (await db.execute(base)).all()
+
     documents = []
+    grouped: dict = {}
     for doc, hospital_name in rows:
-        documents.append(DocumentResponse(
-            id=str(doc.id),
-            document_number=doc.document_number,
-            title=doc.title,
-            document_type=doc.document_type,
-            category=doc.category,
-            hospital_name=hospital_name,
-            hospital_id=doc.hospital_id,
-            department=doc.department,
-            doctor_name=doc.doctor_name,
-            document_date=doc.document_date,
-            page_count=doc.page_count,
-            summary=doc.summary,
-            diagnoses=doc.diagnoses,
-            keywords=doc.keywords,
-            thread_id=str(doc.thread_id) if doc.thread_id else None,
-            file_path=doc.file_path
-        ))
-    
-    return SearchResult(documents=documents, total=total, page=page, page_size=page_size)
+        d = DocumentResponse(
+            id=str(doc.id), document_number=doc.document_number, title=doc.title,
+            document_type=doc.document_type, category=doc.category, hospital_name=hospital_name,
+            hospital_id=doc.hospital_id, department=doc.department, doctor_name=doc.doctor_name,
+            document_date=doc.document_date, page_count=doc.page_count, summary=doc.summary,
+            thread_id=str(doc.thread_id) if doc.thread_id else None, file_path=doc.file_path,
+        )
+        documents.append(d)
+        dept = doc.department or "Uten avdeling"
+        grouped.setdefault(dept, []).append(d.id)
+
+    return SearchResult(
+        documents=documents, total=total, page=page, page_size=page_size,
+        grouped_by_department=(grouped if (hospital_id or group_by_department) else {}),
+    )
+
+
+@router.get("/hospital-latest")
+async def hospital_latest_dates(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Newest document date per hospital - so user knows if updates may be missing."""
+    result = await db.execute(
+        select(
+            Hospital.id, Hospital.name,
+            func.max(Document.document_date).label("latest"),
+            func.count(Document.id).label("count"),
+        ).outerjoin(Document, Document.hospital_id == Hospital.id)
+        .group_by(Hospital.id, Hospital.name)
+        .order_by(Hospital.name)
+    )
+    out = []
+    for hid, name, latest, count in result.all():
+        if count and count > 0:
+            out.append({
+                "hospital_id": hid, "hospital_name": name,
+                "latest_document_date": str(latest) if latest else None,
+                "document_count": count,
+            })
+    return out
 
 
 @router.get("/{document_id}")
-async def get_document(
-    document_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Get a single document with full details."""
+async def get_document(document_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     result = await db.execute(
         select(Document, Hospital.name.label("hospital_name"))
         .outerjoin(Hospital, Document.hospital_id == Hospital.id)
@@ -232,99 +223,28 @@ async def get_document(
     row = result.one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="Dokument ikke funnet")
-    
     doc, hospital_name = row
-    
-    # Check access
-    if doc.category == "psychiatric" and current_user.role not in ("admin", "doctor", "psychologist"):
+    if doc.category == "psychiatric" and not can_see_psychiatric(current_user):
         raise HTTPException(status_code=403, detail="Ikke tilgang til psykiatriske dokumenter")
-    
     return {
-        "id": str(doc.id),
-        "document_number": doc.document_number,
-        "title": doc.title,
-        "document_type": doc.document_type,
-        "category": doc.category,
-        "hospital_name": hospital_name,
-        "hospital_id": doc.hospital_id,
-        "department": doc.department,
-        "doctor_name": doc.doctor_name,
+        "id": str(doc.id), "document_number": doc.document_number, "title": doc.title,
+        "document_type": doc.document_type, "category": doc.category, "hospital_name": hospital_name,
+        "hospital_id": doc.hospital_id, "department": doc.department, "doctor_name": doc.doctor_name,
         "doctor_approved_by": doc.doctor_approved_by,
         "document_date": str(doc.document_date) if doc.document_date else None,
         "created_date": str(doc.created_date) if doc.created_date else None,
-        "page_count": doc.page_count,
-        "ocr_text": doc.ocr_text,
-        "summary": doc.summary,
-        "diagnoses": doc.diagnoses,
-        "procedures": doc.procedures,
-        "keywords": doc.keywords,
+        "page_count": doc.page_count, "ocr_text": doc.ocr_text, "summary": doc.summary,
+        "diagnoses": doc.diagnoses, "procedures": doc.procedures, "keywords": doc.keywords,
         "thread_id": str(doc.thread_id) if doc.thread_id else None,
-        "file_path": doc.file_path,
-        "file_size_bytes": doc.file_size_bytes,
-        "is_verified": doc.is_verified
+        "sender": doc.sender, "recipient": doc.recipient, "is_reply": doc.is_reply,
+        "correspondence_key": doc.correspondence_key,
+        "file_path": doc.file_path, "file_size_bytes": doc.file_size_bytes, "is_verified": doc.is_verified,
     }
 
 
-@router.post("/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    title: str = "",
-    hospital_id: Optional[int] = None,
-    document_type: Optional[str] = None,
-    document_date: Optional[str] = None,
-    category: str = "somatic",
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Upload a new document (PDF)."""
-    if current_user.role not in ("admin",):
-        raise HTTPException(status_code=403, detail="Kun administrator kan laste opp dokumenter")
-    
-    # Save file
-    file_id = str(uuid.uuid4())
-    file_ext = os.path.splitext(file.filename)[1] or ".pdf"
-    file_path = os.path.join(settings.UPLOAD_DIR, f"{file_id}{file_ext}")
-    
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    
-    file_size = os.path.getsize(file_path)
-    
-    # Parse date
-    doc_date = None
-    if document_date:
-        try:
-            doc_date = datetime.strptime(document_date, "%Y-%m-%d").date()
-        except ValueError:
-            pass
-    
-    # Create document record
-    doc = Document(
-        title=title or file.filename,
-        document_type=document_type,
-        category=category,
-        hospital_id=hospital_id,
-        document_date=doc_date,
-        file_path=file_path,
-        file_size_bytes=file_size,
-        uploaded_by=current_user.id
-    )
-    db.add(doc)
-    await db.commit()
-    await db.refresh(doc)
-    
-    # TODO: Trigger async OCR and AI processing via Celery
-    
-    return {"id": str(doc.id), "message": "Dokument lastet opp", "file_path": file_path}
-
-
 @router.get("/{document_id}/pdf")
-async def get_document_pdf(
-    document_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """Serve the PDF file for a document by its ID."""
+async def get_document_pdf(document_id: str, db: AsyncSession = Depends(get_db)):
+    """Serve the PDF file for a document by its ID (inline)."""
     result = await db.execute(select(Document).where(Document.id == uuid.UUID(document_id)))
     doc = result.scalar_one_or_none()
     if not doc or not doc.file_path:
@@ -334,13 +254,44 @@ async def get_document_pdf(
     return FileResponse(doc.file_path, media_type="application/pdf", filename=os.path.basename(doc.file_path))
 
 
+@router.get("/{document_id}/correspondence")
+async def get_correspondence(document_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Return the full correspondence thread this document belongs to, chronologically."""
+    result = await db.execute(select(Document).where(Document.id == uuid.UUID(document_id)))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Dokument ikke funnet")
+
+    key = doc.correspondence_key
+    if not key:
+        # No thread - return just this doc
+        return {"correspondence_key": None, "documents": [await _doc_brief(db, doc)]}
+
+    rows = await db.execute(
+        select(Document, Hospital.name.label("hn")).outerjoin(Hospital, Document.hospital_id == Hospital.id)
+        .where(Document.correspondence_key == key).order_by(Document.document_date.asc())
+    )
+    docs = []
+    for d, hn in rows.all():
+        docs.append({
+            "id": str(d.id), "title": d.title, "document_type": d.document_type,
+            "document_date": str(d.document_date) if d.document_date else None,
+            "hospital_name": hn, "sender": d.sender, "recipient": d.recipient,
+            "is_reply": d.is_reply, "summary": d.summary,
+        })
+    return {"correspondence_key": key, "documents": docs}
+
+
+async def _doc_brief(db, doc):
+    return {
+        "id": str(doc.id), "title": doc.title, "document_type": doc.document_type,
+        "document_date": str(doc.document_date) if doc.document_date else None,
+        "sender": doc.sender, "recipient": doc.recipient, "summary": doc.summary,
+    }
+
+
 @router.get("/thread/{thread_id}")
-async def get_thread_documents(
-    thread_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Get all documents in a thread (related documents chain)."""
+async def get_thread_documents(thread_id: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     result = await db.execute(
         select(Document, Hospital.name.label("hospital_name"))
         .outerjoin(Hospital, Document.hospital_id == Hospital.id)
@@ -348,12 +299,8 @@ async def get_thread_documents(
         .order_by(Document.document_date.asc())
     )
     rows = result.all()
-    
     return [{
-        "id": str(doc.id),
-        "title": doc.title,
-        "document_type": doc.document_type,
-        "hospital_name": hospital_name,
-        "document_date": str(doc.document_date) if doc.document_date else None,
-        "doctor_name": doc.doctor_name
+        "id": str(doc.id), "title": doc.title, "document_type": doc.document_type,
+        "hospital_name": hospital_name, "document_date": str(doc.document_date) if doc.document_date else None,
+        "doctor_name": doc.doctor_name,
     } for doc, hospital_name in rows]

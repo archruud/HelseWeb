@@ -14,7 +14,7 @@ export default function PrivateFiles() {
         <h2 className="text-2xl font-bold flex items-center gap-2">
           <Shield className="text-green-600" /> Mine private filer
         </h2>
-        <button className="bg-green-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-green-700">
+        <button onClick={() => alert('Opplasting kommer i Steg 7 (lydtranskribering)')} className="bg-green-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-green-700">
           <Upload size={16} /> Last opp fil
         </button>
       </div>
