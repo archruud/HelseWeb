@@ -12,7 +12,7 @@ import shutil
 
 from app.config import settings
 from app.database import get_db
-from app.models import Document, Hospital, User
+from app.models import Document, Hospital, User, JournalEntry
 from app.routers.auth import get_current_user, user_permissions
 
 router = APIRouter()
@@ -188,6 +188,54 @@ async def search_documents(
         documents=documents, total=total, page=page, page_size=page_size,
         grouped_by_department=(grouped if (hospital_id or group_by_department) else {}),
     )
+
+
+@router.get("/entries/search")
+async def search_entries(
+    q: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    hospital_id: Optional[int] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Search dated journal entries - finds actual events by their real date
+    (e.g. 1990-1995 finds entries from that period even inside big scanned documents)."""
+    filters = []
+    rank_order = None
+    if q:
+        ts_query = func.plainto_tsquery('norwegian', q)
+        filters.append(or_(JournalEntry.search_vector.op('@@')(ts_query), JournalEntry.content.ilike(f"%{q}%")))
+        rank_order = func.ts_rank(JournalEntry.search_vector, ts_query)
+    if date_from:
+        filters.append(JournalEntry.entry_date >= date_from)
+    if date_to:
+        filters.append(JournalEntry.entry_date <= date_to)
+    if hospital_id:
+        filters.append(JournalEntry.hospital_id == hospital_id)
+
+    base = select(JournalEntry, Hospital.name.label("hn"), Document.title.label("doc_title")) \
+        .outerjoin(Hospital, JournalEntry.hospital_id == Hospital.id) \
+        .outerjoin(Document, JournalEntry.document_id == Document.id)
+    count_q = select(func.count(JournalEntry.id))
+    if filters:
+        base = base.where(and_(*filters))
+        count_q = count_q.where(and_(*filters))
+    total = (await db.execute(count_q)).scalar()
+    if rank_order is not None:
+        base = base.order_by(desc(rank_order), JournalEntry.entry_date.asc())
+    else:
+        base = base.order_by(JournalEntry.entry_date.asc())
+    base = base.offset((page - 1) * page_size).limit(page_size)
+    rows = (await db.execute(base)).all()
+    entries = [{
+        "id": str(e.id), "document_id": str(e.document_id), "entry_date": str(e.entry_date) if e.entry_date else None,
+        "heading": e.heading, "hospital_name": hn, "document_title": doc_title,
+        "excerpt": (e.content or "")[:400],
+    } for e, hn, doc_title in rows]
+    return {"entries": entries, "total": total, "page": page, "page_size": page_size}
 
 
 @router.get("/hospital-latest")

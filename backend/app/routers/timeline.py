@@ -7,7 +7,7 @@ from sqlalchemy import select, and_, func, delete
 from pydantic import BaseModel
 
 from app.database import get_db
-from app.models import TimelineEvent, Hospital, Document, User
+from app.models import TimelineEvent, Hospital, Document, User, JournalEntry
 from app.routers.auth import get_current_user, require_permission
 
 router = APIRouter()
@@ -107,33 +107,33 @@ async def auto_generate_timeline(db: AsyncSession = Depends(get_db), current_use
     # Remove existing auto-generated events
     await db.execute(delete(TimelineEvent).where(TimelineEvent.auto_generated == True))
 
-    # Load documents with dates
+    # Use DATED journal entries (real dates inside documents) when available
     rows = (await db.execute(
-        select(Document, Hospital.name.label("hn")).outerjoin(Hospital, Document.hospital_id == Hospital.id)
-        .where(Document.document_date.isnot(None))
-        .order_by(Document.document_date.asc())
+        select(JournalEntry, Hospital.name.label("hn")).outerjoin(Hospital, JournalEntry.hospital_id == Hospital.id)
+        .where(JournalEntry.entry_date.isnot(None))
+        .order_by(JournalEntry.entry_date.asc())
     )).all()
 
     created = 0
     seen = set()  # (date, type) to limit noise
-    for doc, hn in rows:
-        text_l = ((doc.title or "") + " " + (doc.ocr_text or "")[:3000]).lower()
+    for entry, hn in rows:
+        text_l = ((entry.heading or "") + " " + (entry.content or "")[:2000]).lower()
         for kw, severity, etype, label in EVENT_RULES:
             if kw in text_l:
-                key = (str(doc.document_date), etype)
+                key = (str(entry.entry_date), etype)
                 if key in seen:
                     continue
                 seen.add(key)
                 ev = TimelineEvent(
                     title=f"{label}",
-                    description=f"{doc.title} ({hn or 'ukjent sykehus'})",
-                    event_date=doc.document_date,
+                    description=f"{(entry.heading or '')[:80]} ({hn or 'ukjent sykehus'})",
+                    event_date=entry.entry_date,
                     event_type=etype, severity=severity,
-                    hospital_id=doc.hospital_id, document_id=doc.id,
+                    hospital_id=entry.hospital_id, document_id=entry.document_id,
                     auto_generated=True,
                 )
                 db.add(ev)
                 created += 1
-                break  # one event per document max
+                break
     await db.commit()
     return {"message": f"Tidslinje generert: {created} hendelser opprettet"}

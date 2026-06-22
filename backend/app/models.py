@@ -10,6 +10,18 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 
 
+class JournalEntry(Base):
+    __tablename__ = "journal_entries"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id = Column(UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"))
+    entry_date = Column(Date)
+    page_number = Column(Integer)
+    heading = Column(Text)
+    content = Column(Text)
+    hospital_id = Column(Integer, ForeignKey("hospitals.id"))
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
+
 class User(Base):
     __tablename__ = "users"
 

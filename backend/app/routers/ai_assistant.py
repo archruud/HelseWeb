@@ -1,16 +1,15 @@
-"""AI Assistant router - RAG-based Q&A over medical records with citations."""
+"""AI Assistant router - semantic RAG over dated journal entries with citations."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_, desc
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import List
 import httpx
-import uuid
 
 from app.config import settings
 from app.database import get_db
-from app.models import Document, Hospital, AuditLog, User
+from app.models import AuditLog, User
 from app.routers.auth import get_current_user, user_permissions
+from app.semantic import semantic_search_entries
 
 router = APIRouter()
 
@@ -29,49 +28,24 @@ SYSTEM_PROMPT = """Du er en medisinsk forskningsassistent for pasienten Terje Jo
 Du hjelper leger og spesialister med å finne informasjon i hans omfattende journaler.
 
 VIKTIGE REGLER:
-- Du skal ALLTID oppgi hvilke dokumenter du baserer svaret på (tittel + dato + sykehus).
-- Du skal ALDRI stille diagnoser eller gi behandlingsråd - kun gjengi og oppsummere det som står i journalene.
-- Du skal svare på norsk, presist og strukturert.
+- Du skal ALLTID oppgi hvilke dokumenter/datoer du baserer svaret på.
+- Du skal ALDRI stille diagnoser eller gi behandlingsråd - kun gjengi og oppsummere journalinnhold.
+- Du skal svare på norsk, presist og strukturert, og være kildekritisk.
 - Hvis informasjon mangler i utdragene, si det tydelig.
-- Når du ser en korrespondanse (henvisning og svar), beskriv sammenhengen.
+- Beskriv kronologi når det er relevant (når skjedde hva).
 - Vær spesielt oppmerksom på forhold relevant for CIPO (kronisk intestinal pseudo-obstruksjon):
-  tarmmotilitet, pseudo-obstruksjon, intravenøs ernæring, langvarige magesmerter, pankreas."""
-
-
-async def retrieve_relevant_docs(db: AsyncSession, question: str, limit: int = 8):
-    """Retrieve relevant documents using PostgreSQL full-text search (ts_rank)."""
-    ts_query = func.plainto_tsquery('norwegian', question)
-    stmt = (
-        select(Document, Hospital.name.label("hn"), func.ts_rank(Document.search_vector, ts_query).label("rank"))
-        .outerjoin(Hospital, Document.hospital_id == Hospital.id)
-        .where(Document.search_vector.op('@@')(ts_query))
-        .order_by(desc("rank"))
-        .limit(limit)
-    )
-    rows = (await db.execute(stmt)).all()
-    if not rows:
-        # Fallback: keyword ILIKE on first significant words
-        words = [w for w in question.split() if len(w) > 3][:3]
-        if words:
-            conds = [Document.ocr_text.ilike(f"%{w}%") for w in words]
-            stmt2 = (
-                select(Document, Hospital.name.label("hn"))
-                .outerjoin(Hospital, Document.hospital_id == Hospital.id)
-                .where(or_(*conds)).order_by(Document.document_date.desc()).limit(limit)
-            )
-            rows = [(d, hn, 0.0) for d, hn in (await db.execute(stmt2)).all()]
-    return rows
+  tarmmotilitet, pseudo-obstruksjon, intravenøs/parenteral ernæring, langvarige magesmerter, pankreas."""
 
 
 async def query_ollama(question: str, context: str) -> str:
-    full_prompt = f"""Basert på følgende journalutdrag, svar på spørsmålet.
+    full_prompt = f"""Basert på følgende daterte journalutdrag, svar på spørsmålet.
 
-JOURNALUTDRAG:
+JOURNALUTDRAG (med dato og sykehus):
 {context}
 
 SPØRSMÅL: {question}
 
-SVAR (oppgi alltid kilde-dokumenter med tittel og dato):"""
+SVAR (oppgi alltid dato og kilde for det du nevner):"""
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
             response = await client.post(
@@ -96,27 +70,26 @@ async def ai_query(query: AIQuery, db: AsyncSession = Depends(get_db), current_u
     if "ai_query" not in user_permissions(current_user.role):
         raise HTTPException(status_code=403, detail="Din rolle har ikke tilgang til AI-søk")
 
-    rows = await retrieve_relevant_docs(db, query.question, limit=8)
+    # Semantic retrieval over dated journal entries
+    hits = await semantic_search_entries(db, query.question, limit=8)
 
-    context_parts, source_docs = [], []
-    for item in rows:
-        doc = item[0]
-        hn = item[1]
-        snippet = (doc.ocr_text or "")[:1800]
-        header = f"[Dokument: {doc.title} | Dato: {doc.document_date} | Sykehus: {hn or 'ukjent'}"
-        if doc.sender:
-            header += f" | Fra: {doc.sender}"
-        if doc.recipient:
-            header += f" | Til: {doc.recipient}"
+    context_parts, source_docs, seen_docs = [], [], set()
+    for h in hits:
+        header = f"[Dato: {h['entry_date']} | Sykehus: {h['hospital_name'] or 'ukjent'}"
+        if h.get("heading"):
+            header += f" | {h['heading']}"
         header += "]"
-        context_parts.append(f"{header}\n{snippet}")
-        source_docs.append({
-            "id": str(doc.id), "title": doc.title,
-            "date": str(doc.document_date) if doc.document_date else None,
-            "document_type": doc.document_type, "hospital_name": hn,
-        })
+        context_parts.append(f"{header}\n{(h['content'] or '')[:1600]}")
+        if h["document_id"] not in seen_docs:
+            seen_docs.add(h["document_id"])
+            source_docs.append({
+                "id": h["document_id"],
+                "title": f"{h.get('heading') or h.get('doc_title') or 'Journal'} ({h['entry_date']})",
+                "date": h["entry_date"],
+                "hospital_name": h["hospital_name"],
+            })
 
-    context = "\n\n---\n\n".join(context_parts) if context_parts else "Ingen relevante dokumenter funnet."
+    context = "\n\n---\n\n".join(context_parts) if context_parts else "Ingen relevante journaloppføringer funnet."
     answer = await query_ollama(query.question, context)
 
     db.add(AuditLog(user_id=current_user.id, action="ai_query", resource_type="ai",
