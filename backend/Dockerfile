@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr-eng \
     libpq-dev \
     poppler-utils \
+    ocrmypdf \
+    ghostscript \
+    unpaper \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
