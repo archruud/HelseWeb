@@ -140,10 +140,13 @@ async def search_documents(
         filters.append(Document.category == category)
     if department:
         filters.append(Document.department.ilike(f"%{department}%"))
-    if date_from:
-        filters.append(Document.document_date >= date_from)
-    if date_to:
-        filters.append(Document.document_date <= date_to)
+    # Date filter only applies in document search when NOT filtering by hospital.
+    # (Hospital filter should show ALL docs from that hospital regardless of date,
+    #  since scanned docs may have scan-date not content-date. Use entries-search for date ranges.)
+    if date_from and not hospital_id:
+        filters.append(or_(Document.document_date >= date_from, Document.document_date.is_(None)))
+    if date_to and not hospital_id:
+        filters.append(or_(Document.document_date <= date_to, Document.document_date.is_(None)))
 
     if not can_see_psychiatric(current_user):
         filters.append(Document.category != "psychiatric")
